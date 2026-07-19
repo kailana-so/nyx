@@ -1,110 +1,111 @@
 # nyx
 
-Local-first AI development assistant. Claude for thinking, Qwen3 for building.
+AI coding assistant. One session, all modes as slash commands.
 
 ```
-nyx chat    → advisor session (Claude) — memory, specs, decisions
-nyx code    → coding agent (Qwen3, local) — implements a spec
-nyx test    → test agent (Qwen3, local) — writes failing tests first
-nyx ideas   → browse and update the ideas parking lot
+nyx        → open REPL (project = current directory)
+nyx cost   → show token usage and cost breakdown
 ```
-
-## How it works
-
-You talk to the advisor in one Ghostty pane. When a spec is approved it gets saved to Supabase. You open a second pane when you're ready and run `nyx code` — no auto-spawning, no magic. The coding agent runs Qwen3 locally with full tool use (read, write, bash) and streams its thinking live.
-
-Memory persists across sessions via Supabase + Voyage AI embeddings. The same Supabase project can be shared with a work machine so decisions and context follow you.
 
 ## Setup
 
 ```bash
-git clone <repo-url> ~/Documents/nyx_v1   # any path is fine; install.sh self-locates
+git clone <repo> ~/Documents/nyx_v1
 cd ~/Documents/nyx_v1
-./scripts/install.sh
+uv sync
 ```
 
-`install.sh` runs `uv sync`, symlinks `bin/nyx` into `~/.local/bin/`, scaffolds `.env` from `.env.example`, and prints next steps (fill in keys, pull `qwen3:14b` if you'll use `--local`, paste the migrations into a fresh Supabase project). Re-running is always safe.
+Add API keys to `.env`:
 
-If you're already using lilith_v2, reuse the same `SUPABASE_URL`, `SUPABASE_KEY`, and `VOYAGE_API_KEY` — nyx reads from the same tables.
-
-## Personal vs work scoping
-
-nyx scopes data by `NYX_PROFILE`. Set the default per machine in `.env`:
-
-| Machine | `NYX_PROFILE` |
-|---|---|
-| Home | `personal` |
-| Work | `work` |
-
-The same Supabase project backs both — projects, specs, decisions, ideas, learnings are tagged with the profile that created them. Default queries filter to the active profile.
-
-To **cross-fetch** from the other scope (e.g. read a work-project decision while working personally), pass `--profile <other>` to the relevant subcommand:
-
-```bash
-nyx specs --profile work          # see work specs from a personal session
-nyx ideas --profile work          # cross-scope idea browsing
-nyx learn list --profile work     # search work learnings
+```env
+ANTHROPIC_API_KEY=...
+OPENAI_API_KEY=...
+GEMINI_API_KEY=...
+AWS_REGION=ap-southeast-2   # for qwen235b via Bedrock
 ```
 
-Data follows you across machines (one Supabase project, profile-tagged rows); day-to-day commands stay scoped to whichever context you're actually working in.
+Configure model and Obsidian vault path in `~/.nyx/config.json` (created on first run):
 
-## Workflow
-
-```
-# Pane 1 — advisor
-nyx chat
-
-# Talk through what you want to build.
-# Advisor drafts a spec, you approve it.
-# Spec is saved, advisor prints the ID.
-
-# Pane 2 — open a Ghostty split, cd to your project
-nyx code          # shows pending specs, pick one
-# or
-nyx code --spec-id <uuid>
-
-# Qwen3 reads the spec, explores the codebase, writes code, runs tests.
-# Streams thinking + tool calls live. Calls done() when finished.
+```json
+{ "model": "anthropic", "tier": "balanced", "vault": "/path/to/your/obsidian" }
 ```
 
-### Advisor slash commands
+## Modes
+
+One agent, one continuous conversation. Modes change permissions and focus — switching never resets context. Edits are always shown as diffs; `/plan` blocks them, `/chat` asks per edit (`y` / `a`lways / `n`o — or type feedback, which goes back to the model), `/code` and `/test` auto-approve.
+
+Mode commands take an optional inline message: `/code fix the failing test` switches and runs it.
+
+## Slash commands
 
 | Command | Action |
-|---------|--------|
-| `/compact` | Summarise and compress conversation history |
-| `/ideas` | Show ideas inline |
+|---|---|
+| `/chat` | Default mode — edits need per-edit approval |
+| `/plan` | Plan mode — read-only, produces specs saved to vault |
+| `/code` | Code mode — edits auto-approved (shown as diffs) |
+| `/test` | Test mode — TDD, writes failing tests first |
+| `/auto` | Toggle auto-approve for edits in chat mode |
+| `/learn` | Switch to learn mode — collect notes |
+| `/write` | (in learn mode) Format notes → save to vault as `learnings/<slug>.md` |
+| `/compact` | Summarise history → save episodic to vault → clear history |
+| `/practice [pattern] [lang]` | Save current discussion to `best-practices/<pattern>/<lang>.md` |
+| `/update-architecture` | Generate `architecture/client/*.md` and `architecture/server/*.md` in repo |
+| `/model <provider>[:<tier>]` | Switch model — e.g. `/model openai:top` |
+| `/ideas` | Print saved ideas for the current project |
 
-### Ideas statuses
+## Models
 
-`parked` → `exploring` → `adopted` / `dropped`
+| Provider | Tiers |
+|---|---|
+| `anthropic` | `cheap` (haiku) · `balanced` (sonnet) · `top` (opus) |
+| `openai` | `cheap` (gpt-4o-mini) · `balanced` (gpt-4o) · `top` (gpt-5) |
+| `gemini` | `cheap` (flash-lite) · `balanced` (flash) · `top` (pro) |
+| `qwen235b` | (single model via AWS Bedrock) |
 
-Update from the ideas command: `u 2 exploring`
+## Memory
 
-## Project structure
+Everything lives in your Obsidian vault:
+
+```
+<vault>/
+  projects/<name>/
+    specs/           ← saved by plan agent
+    decisions.md     ← appended by save_decision tool
+    ideas.md         ← appended by save_idea tool
+  episodic/<name>/
+    YYYY-MM-DD.md    ← written on /compact and on clean exit
+  best-practices/<pattern>/
+    <language>.md    ← written by /practice
+  learnings/
+    <slug>.md        ← written by /write in learn mode
+```
+
+Architecture docs live in the repo:
+
+```
+<project>/
+  architecture/
+    client/<feature>.md
+    server/<service>.md
+```
+
+## Project layout
 
 ```
 nyx/
-├── chat.py       advisor loop
-├── agent.py      Qwen3 tool-use loop (coding + test)
-├── cli.py        CLI entry point
-├── memory/
-│   ├── supabase.py   all DB ops
-│   └── embed.py      Voyage AI embeddings
-├── tools/
-│   └── fs.py         read_file, write_file, run_bash, list_dir
-├── agents/
-│   ├── advisor.md    Claude system prompt
-│   ├── coding.md     Qwen3 coding agent prompt
-│   └── test.md       Qwen3 test agent prompt
-└── lib/
-    ├── models.py     model constants
-    ├── format.py     Rich output helpers
-    └── session.py    profile/project from env
-```
-
-## Switching projects
-
-```bash
-NYX_PROJECT=my-app nyx chat
-# or set in .env
+  cli.py        entry point
+  repl.py       single agent loop: modes, approval gate, slash commands
+  lib/
+    config.py   ~/.nyx/config.json + project = cwd
+    llm.py      LangChain model factory + stream_turn()
+    tools.py    tool registry (fs + memory tools)
+    memory.py   Obsidian read/write
+    usage.py    cost tracking (~/.nyx/usage.jsonl)
+    format.py   Rich output
+    chat_input.py  prompt-toolkit input
+  agents/
+    nyx.md      base system prompt (always active)
+    plan.md     plan mode overlay
+    code.md     code mode overlay
+    test.md     test mode overlay
 ```
