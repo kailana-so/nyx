@@ -17,15 +17,19 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
-from nyx.lib.config import get_model, get_tier, project_name, project_root, set_model
+from nyx.lib.config import (
+    get_favourites, get_model, get_surfaces, get_tier, project_name,
+    project_root, set_model, set_surface,
+)
 from nyx.lib.format import console
-from nyx.lib.llm import get_caps, get_model as make_model, make_ai_message, make_text_tool_result, make_tool_message, quiet_turn, stream_turn
+from nyx.lib.llm import MODELS, TIERS, get_caps, get_model as make_model, model_id, make_ai_message, make_text_tool_result, make_tool_message, quiet_turn, stream_turn
 from nyx.lib import deps, notes
 from nyx.lib.memory import (
     pending_dir, queue_proposals, read_architecture_index, read_decisions,
     read_episodic, read_ideas, read_practices, read_project_context,
     take_proposals, write_episodic, write_practice,
 )
+from nyx.lib.chat_input import pick_from_list
 from nyx.lib.tools import execute_tool, read_verdict, to_langchain_tools
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -76,23 +80,152 @@ _READONLY_MODES = {"plan", "validate-plan", "code-validator"}
 # architecture index. chat/visualise/learn don't need the structural contract.
 _ARCH_MODES = {"plan", "code", "test", "validate-plan", "code-validator"}
 
+# Which tier each surface runs on. Unlisted surfaces fall back to the session's
+# own tier, so this is a set of deliberate exceptions, not a table to maintain.
+_SURFACE_TIER = {
+    "plan": "thinker", "validate-plan": "thinker", "code-validator": "thinker",
+    "compact": "worker", "learn": "worker", "practice": "worker", "visualise": "worker",
+}
+
+# Bedrock models aren't in OpenRouter's catalogue, so the live list can't know
+# about them. Kept as rows so the menu shows everything reachable, not just
+# everything routed.
+_LOCAL_MODELS = [("devstral", "mistral.devstral-2-123b"),
+                 ("deepseek", "deepseek.v3.2"),
+                 ("qwen235b", "qwen.qwen3-235b-a22b-2507-v1:0")]
+
+
+_AXES = ("coding", "thinking", "agentic")
+
+# What each surface is actually doing, so the list sorts by the score that
+# matters for the thing you're assigning rather than by one fixed column.
+_SURFACE_AXIS = {
+    "code": "coding", "test": "coding",
+    "plan": "thinking", "validate-plan": "thinking", "code-validator": "thinking",
+    "chat": "agentic", "visualise": "coding", "learn": "thinking",
+}
+
+
+def _model_rows(target: str = "session", filter_text: str = "") -> list[tuple[str, str]]:
+    """(provider, model id), best first for whatever `target` does. One row per
+    model — a model good at several jobs is one row with several scores, not the
+    same name repeated under three headings."""
+    from nyx.lib.llm import catalogue
+    live = catalogue()
+    axis = _SURFACE_AXIS.get(target, "coding")
+    favourites = get_favourites()
+
+    ranked = sorted(live, key=lambda m: (m["id"] not in favourites, -m.get(axis, -1.0)))
+    rows = [("openrouter", m["id"]) for m in ranked] + _LOCAL_MODELS
+    if filter_text:
+        rows = [r for r in rows if filter_text.lower() in r[1].lower()]
+    return rows
+
+
+def _routing_line(s: Session) -> str:
+    """What will actually run, grouped by model. Naming a provider and a tier
+    told you neither which model you get nor that modes can differ."""
+    by_model: dict[str, list[str]] = {}
+    for surface in ("chat", "code", "test", "plan", "compact"):
+        by_model.setdefault(model_id(s.provider_for(surface), s.tier_for(surface)), []).append(surface)
+    if len(by_model) == 1:
+        return f"all modes → {next(iter(by_model))}"
+    return " · ".join(f"{'/'.join(surfaces)} → {model}" for model, surfaces in by_model.items())
+
+
+def _model_lines(rows: list[tuple[str, str]], target: str) -> tuple[str, list[str]]:
+    """(header, one plain-text line per row) for the arrow-key picker. Plain
+    because the picker styles the selected row itself."""
+    from nyx.lib.llm import catalogue, get_caps
+    from nyx.lib.usage import _PRICES
+    priced = {m["id"]: m for m in catalogue()}
+    favourites = set(get_favourites())
+    current = {v: k for k, v in get_surfaces().items()}
+    axis = _SURFACE_AXIS.get(target, "coding")
+    labels = {"coding": "CODE", "thinking": "THINK", "agentic": "TOOLS"}
+
+    # Only the column being sorted on earns a slot: two thirds of the catalogue
+    # is unscored, so three score columns were mostly dashes crowding out the
+    # description, which is the only thing those rows can tell you.
+    fixed = 2 + 38 + 7 + 16 + 8 + 10
+    room = max(24, console.width - fixed - 4)
+    header = (f"  {'MODEL':<38}{labels[axis] + '▾':>7}{'$IN/$OUT per 1M':>16}{'CONTEXT':>8}  "
+              f"{'CACHE':<10}WHAT IT IS")
+
+    lines = []
+    for provider, mid in rows:
+        info = priced.get(mid)
+        rate = (info["in"], info["out"]) if info else _PRICES.get(mid)
+        # OpenRouter prices routers at -1 — a sentinel for "depends which model
+        # this routes to", not a rate.
+        if not rate:
+            price = "—"
+        elif min(rate) < 0:
+            price = "varies"
+        else:
+            price = f"${rate[0]:g}/${rate[1]:g}"
+        ctx = f"{info['context'] // 1000}k" if info and info["context"] else "—"
+        score = f"{info[axis]:.1f}" if info and axis in info else "—"
+        blurb = ((info or {}).get("blurb") or MODELS.get(provider, {}).get("blurb", ""))[:room]
+        star = "★" if mid in favourites else " "
+        used = f" · {current[mid]}" if mid in current else ""
+        name = mid if len(mid) <= 38 else mid[:37] + "…"
+        lines.append(f"{star} {name:<38}{score:>7}{price:>16}{ctx:>8}  "
+                     f"{get_caps(provider, mid)['cache']:<10}{blurb}{used}")
+    return header, lines
+
+
+def _model_menu(s: Session, rows: list[tuple[str, str]], target: str) -> str:
+    """Numbered fallback for when there's no terminal to run the picker in.
+    Same rows, same columns — one place composes a row, so the two views can't
+    drift into disagreeing about what a model costs."""
+    header, lines = _model_lines(rows, target)
+    head = (f"assign a model to [bold]{target}[/bold]" if target != "session"
+            else "[bold]session model[/bold]  [dim]— surfaces you've assigned keep theirs[/dim]")
+    out = [f"  {head}", f"  [dim]{header}[/dim]"]
+    out += [f"  [dim]{i:>3}[/dim] [dim]{escape(line)}[/dim]" for i, line in enumerate(lines, 1)]
+    out.append("\n  [dim]SCORE = artificialanalysis.ai index for the sorted column[/dim]")
+    return "\n".join(out)
+
 
 @dataclass
 class Session:
-    model: object
     provider: str
     tier: str
     mode: str = "chat"
     auto_approve: bool = False
     history: list[BaseMessage] = field(default_factory=list)
     learn_history: list[BaseMessage] = field(default_factory=list)
-    _cheap: object = None
+    _models: dict = field(default_factory=dict)
+
+    def tier_for(self, surface: str) -> str:
+        """What a surface runs on, most specific first: a model you assigned to
+        this surface, then a model pinned for the session, then the tier map."""
+        if (assigned := get_surfaces().get(surface)):
+            return assigned
+        if self.tier not in TIERS:
+            return self.tier
+        return _SURFACE_TIER.get(surface, self.tier)
+
+    def provider_for(self, surface: str) -> str:
+        """A surface can be assigned a model from another provider — a Bedrock
+        id while the session runs on OpenRouter. The model decides its provider,
+        not the session, or the id would be sent to the wrong endpoint."""
+        tier = self.tier_for(surface)
+        return next((p for p, m in _LOCAL_MODELS if m == tier),
+                    "openrouter" if "/" in tier else self.provider)
+
+    def model_for(self, surface: str):
+        """The model for a surface, built once and reused. Switching modes
+        mid-session must not pay to reconstruct a client each turn."""
+        key = (self.provider_for(surface), self.tier_for(surface))
+        if key not in self._models:
+            self._models[key] = make_model(*key)
+        return self._models[key]
 
     def side_model(self):
-        """Cheap-tier model for side tasks (compact, notes, summaries)."""
-        if self._cheap is None:
-            self._cheap = make_model(self.provider, "cheap")
-        return self._cheap
+        """Unattended side tasks — compact, notes, summaries."""
+        return self.model_for("compact")
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -460,12 +593,12 @@ def _run_turn(s: Session, user_content=None) -> None:
     tools = _tools_for(s.mode)
     # No prompt cache to preserve → prune mid-turn; otherwise only at turn end,
     # so the cached prefix stays byte-identical across rounds.
-    prune_in_turn = get_caps(s.provider)["cache"] == "none"
+    prune_in_turn = get_caps(s.provider_for(s.mode), s.tier_for(s.mode))["cache"] == "none"
     if user_content is not None:
         s.history.append(HumanMessage(content=user_content))
 
-    text, tool_calls = stream_turn(s.model, system, s.history, tools,
-                                   provider=s.provider, tier=s.tier, surface=s.mode)
+    text, tool_calls = stream_turn(s.model_for(s.mode), system, s.history, tools,
+                                   provider=s.provider_for(s.mode), tier=s.tier_for(s.mode), surface=s.mode)
     s.history.append(make_ai_message(text, tool_calls))
 
     rounds = 0
@@ -508,12 +641,12 @@ def _run_turn(s: Session, user_content=None) -> None:
                     "Stop calling tools. You already have everything you need — "
                     "answer now with what you have."
                 )))
-                text, _ = stream_turn(s.model, system, s.history, [],
-                                      provider=s.provider, tier=s.tier, surface=s.mode)
+                text, _ = stream_turn(s.model_for(s.mode), system, s.history, [],
+                                      provider=s.provider_for(s.mode), tier=s.tier_for(s.mode), surface=s.mode)
                 s.history.append(make_ai_message(text, []))
                 return
-            text, tool_calls = stream_turn(s.model, system, s.history, tools,
-                                           provider=s.provider, tier=s.tier, surface=s.mode)
+            text, tool_calls = stream_turn(s.model_for(s.mode), system, s.history, tools,
+                                           provider=s.provider_for(s.mode), tier=s.tier_for(s.mode), surface=s.mode)
             s.history.append(make_ai_message(text, tool_calls))
             if (not tool_calls and wrote_files and not verified and not nudged
                     and (s.mode in _AUTO_MODES or s.auto_approve)):
@@ -524,8 +657,8 @@ def _run_turn(s: Session, user_content=None) -> None:
                     "tests/checks on what you changed now; fix any failures; then give "
                     "your final answer."
                 )))
-                text, tool_calls = stream_turn(s.model, system, s.history, tools,
-                                               provider=s.provider, tier=s.tier, surface=s.mode)
+                text, tool_calls = stream_turn(s.model_for(s.mode), system, s.history, tools,
+                                               provider=s.provider_for(s.mode), tier=s.tier_for(s.mode), surface=s.mode)
                 s.history.append(make_ai_message(text, tool_calls))
     finally:
         # Next turn starts lean on every provider (cross-turn caches are busted
@@ -591,7 +724,7 @@ def _write_notes(s: Session) -> None:
 
     console.print("[dim]Enhancing notes...[/dim]")
     system = _NOTES_SYSTEM
-    reply = quiet_turn(s.model, system, raw, provider=s.provider, tier=s.tier, surface="learn")
+    reply = quiet_turn(s.model_for("learn"), system, raw, provider=s.provider_for("learn"), tier=s.tier_for("learn"), surface="learn")
 
     try:
         data = json.loads(re.sub(r"^```(?:json)?|```$", "", (reply or "").strip(), flags=re.MULTILINE).strip())
@@ -605,14 +738,14 @@ def _write_notes(s: Session) -> None:
     if existing:
         console.print(f"[dim]Merging into existing note: {topic}/{title}[/dim]")
         merged = quiet_turn(
-            s.model,
+            s.model_for("learn"),
             "Weave the new notes into the existing note below. Keep EVERY line of the "
             "existing note — you may reorder and re-header, but never delete or shorten. "
             "Integrate the new material where it belongs. Return the merged markdown body "
             "only: no frontmatter, no title header, no fences.\n\n"
             f"## Existing note\n\n{existing}",
             body,
-            provider=s.provider, tier=s.tier, surface="learn",
+            provider=s.provider_for("learn"), tier=s.tier_for("learn"), surface="learn",
         )
         # The merge must not lose the note that was already there.
         body = merged if merged and len(merged) >= len(existing) else f"{existing}\n\n{body}"
@@ -666,7 +799,7 @@ def _capture(s: Session, transcript: str) -> tuple[str, list[dict]]:
         known += f"\n\n## Already recorded — ideas\n{i}"
 
     raw = quiet_turn(s.side_model(), _CAPTURE_SYSTEM + known, transcript,
-                     provider=s.provider, tier="cheap", surface="compact")
+                     provider=s.provider_for("compact"), tier=s.tier_for("compact"), surface="compact")
     try:
         data = json.loads(re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip())
     except (json.JSONDecodeError, AttributeError):
@@ -832,7 +965,7 @@ def _handle_slash(cmd: str, s: Session) -> None:
         console.print("[dim]Saving practice...[/dim]")
         system = f"Summarise the best practice or architectural pattern discussed in this conversation as a concise markdown document. Pattern: {pattern}, Language/stack: {language}."
         content, _ = stream_turn(s.side_model(), system, s.history, [],
-                                 provider=s.provider, tier="cheap", surface="practice")
+                                 provider=s.provider_for("practice"), tier=s.tier_for("practice"), surface="practice")
         if content:
             path = write_practice(pattern, language, content)
             console.print(f"[green]Saved →[/green] {path}")
@@ -849,26 +982,56 @@ def _handle_slash(cmd: str, s: Session) -> None:
         return
 
     if verb == "model":
-        from nyx.lib.llm import MODELS
-        providers = [p for p in ("openrouter", "anthropic", "openai", "qwen235b", "deepseek", "devstral") if p in MODELS]
-        lines = []
-        for i, p in enumerate(providers, 1):
-            marker = " ←" if p == s.provider else ""
-            lines.append(f"  [dim]{i}[/dim]  {p:<10} [dim]{MODELS[p].get('blurb', '')}[/dim][cyan]{marker}[/cyan]")
-        console.print("\n".join(lines))
+        # /model              → pick the session model
+        # /model code         → pick the model for code mode only
+        # /model code reset   → back to tier routing for that surface
+        # /model <text>       → same, filtered to matching ids
+        target, _, filter_text = rest.partition(" ")
+        if target and target not in _MODES and target != "learn":
+            target, filter_text = "session", rest
+        target = target or "session"
+
+        if filter_text.strip() == "reset":
+            set_surface(target, "")
+            s._models.clear()
+            console.print(f"[cyan]{target}[/cyan] [dim]back to tier routing[/dim]")
+            return
+
+        rows = _model_rows(target, filter_text.strip())
+        if not rows:
+            console.print(f"[yellow]No models match '{filter_text.strip()}'.[/yellow]")
+            return
+        header, lines = _model_lines(rows, target)
+        title = (f"  assign a model to {target}" if target != "session"
+                 else "  session model — surfaces you've assigned keep theirs")
         try:
-            raw = console.input("  pick [#]: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            return
-        if not (raw.isdigit() and 1 <= int(raw) <= len(providers)):
-            console.print("[red]Invalid selection.[/red]")
-            return
-        s.provider = providers[int(raw) - 1]
-        s.tier = "balanced"
-        s.model = make_model(s.provider, s.tier)
-        s._cheap = None
-        set_model(s.provider, s.tier)
-        console.print(f"[cyan]→ {s.provider}[/cyan]  [dim]{MODELS[s.provider].get('blurb', '')}[/dim]")
+            picked = pick_from_list(f"{title}\n{header}", lines)
+            if picked is None:
+                return  # cancelled — leave without redrawing anything
+            provider, model = rows[picked]
+        except Exception:
+            # No terminal to draw on (piped input, a script) — fall back to the
+            # numbered list so /model still works headless.
+            console.print(_model_menu(s, rows, target), highlight=False)
+            try:
+                choice = console.input("  pick [# or model id]: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                return
+            if not choice:
+                return
+            if choice.isdigit() and 1 <= int(choice) <= len(rows):
+                provider, model = rows[int(choice) - 1]
+            else:
+                model = choice
+                provider = next((p for p, m in rows if m == model), "openrouter")
+
+        if target == "session":
+            s.provider, s.tier = provider, model
+            set_model(provider, model)
+        else:
+            set_surface(target, model)
+        s._models.clear()
+        console.print(f"[cyan]{target}[/cyan] [dim]→ {model} · cache={get_caps(provider, model)['cache']}[/dim]")
         return
 
     if verb == "ideas":
@@ -887,13 +1050,11 @@ def run_repl(prompt: str | None = None) -> None:
 
     provider = get_model()
     tier = get_tier()
-    s = Session(model=make_model(provider, tier), provider=provider, tier=tier)
+    s = Session(provider=provider, tier=tier)
     threading.Thread(target=_summarise_pending, args=(s,), daemon=True).start()
 
-    from nyx.lib.llm import MODELS
-    blurb = MODELS.get(provider, {}).get("blurb", "")
     console.print(Panel(
-        f"[bold]nyx[/bold]  [dim]{project_name()}[/dim]  [dim]{provider}:{tier} — {blurb}[/dim]\n\n"
+        f"[bold]nyx[/bold]  [dim]{project_name()}[/dim]\n[dim]{_routing_line(s)}[/dim]\n\n"
         "[dim]/plan  /code  /test  /chat — modes · /auto — toggle edit approval[/dim]\n"
         "[dim]/validate-plan  /visualise  /code-validator — review modes[/dim]\n"
         "[dim]/learn  /compact  /practice  /update-architecture  /model  /ideas[/dim]",

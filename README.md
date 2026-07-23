@@ -18,15 +18,14 @@ uv sync
 Add API keys to `.env` — only for the providers you actually use:
 
 ```env
-OPENROUTER_API_KEY=...       # openrouter (any model, one key)
-OPENAI_API_KEY=...           # openai
-AWS_REGION=ap-southeast-2    # devstral, deepseek, qwen235b via Bedrock
+OPENROUTER_API_KEY=...       # openrouter — the only key you need
+AWS_REGION=ap-southeast-2    # optional: devstral, deepseek, qwen235b via Bedrock
 ```
 
 Configure model and Obsidian vault path in `~/.nyx/config.json` (created on first run):
 
 ```json
-{ "model": "devstral", "tier": "balanced", "vault": "/path/to/your/obsidian" }
+{ "model": "openrouter", "tier": "driver", "vault": "/path/to/your/obsidian" }
 ```
 
 ## Modes
@@ -54,17 +53,26 @@ Mode commands take an optional inline message: `/code fix the failing test` swit
 | `/compact` | Summarise history → write episodic session → clear history |
 | `/practice [pattern] [lang]` | Save current discussion to `best-practices/<pattern>/<lang>.md` |
 | `/update-architecture` | Generate `architecture/**/*.md` in the repo |
-| `/model <provider>[:<tier>]` | Switch model — e.g. `/model openrouter:top` |
+| `/model` | Switch model. Bare for a menu, or `provider:tier` (`/model openrouter:thinker`), or a routed id directly (`/model openrouter:anthropic/claude-opus-4-8`) |
 
 Attach an image to a message with `@path`: `explain this @~/Desktop/screenshot.png`.
 
 ## Models
 
-| Provider | Tiers |
+Tiers name the **job**, not the price — price is not a single quality ordering, and the strongest reasoner is not the best at summarising your notes, just slower and dearer at it.
+
+| Tier | Surfaces | Wants |
+|---|---|---|
+| `worker` | `/compact`, `/learn`, `/practice`, `/visualise` | Cheap, big context, unattended. No tools, no reasoning. |
+| `driver` | `/chat`, `/code`, `/test` | Tool-call reliability over long loops, working cache, fast streaming. |
+| `thinker` | `/plan`, `/validate-plan`, `/code-validator` | Judgement. Rare and short, so per-token price matters least. |
+
+Surfaces route automatically; pinning a model id (`/model openrouter:z-ai/glm-5.2`) overrides the mapping for everything.
+
+| Provider | worker · driver · thinker |
 |---|---|
-| `openrouter` | `cheap` · `balanced` · `top` — any model, one key, host failover |
-| `openai` | `cheap` (gpt-4o-mini) · `balanced` (gpt-4o) · `top` (gpt-5) |
-| `devstral` | single model via AWS Bedrock — daily coding driver, streams fast |
+| `openrouter` | deepseek-v4-flash · kimi-k2.7-code · grok-4.5 |
+| `devstral` | single model via AWS Bedrock — streams fast, no caching |
 | `deepseek` | via AWS Bedrock — very slow, background summaries only |
 | `qwen235b` | via AWS Bedrock — experimental, tools parsed from text |
 
